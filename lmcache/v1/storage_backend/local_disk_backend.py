@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
@@ -158,6 +158,16 @@ class LocalDiskBackend(StorageBackendInterface):
             "disk_io_threads", _DEFAULT_THREAD_COUNT
         )
         self.disk_worker = LocalDiskWorker(loop, max_workers=thread_count)
+
+        # Plain ThreadPoolExecutor for batched_get_blocking (concurrent
+        # synchronous reads).  The existing AsyncPQThreadPoolExecutor in
+        # disk_worker is async/priority-queue based and only serves writes
+        # and prefetches; a simple pool is a better fit for the blocking
+        # read path where we want ThreadPoolExecutor.map() semantics.
+        self._read_thread_pool = ThreadPoolExecutor(
+            max_workers=thread_count,
+            thread_name_prefix="disk-read",
+        )
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
@@ -439,6 +449,120 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """Load multiple KV chunks from disk with concurrent I/O.
+
+        Metadata lookup and memory allocation are performed sequentially
+        under a single lock acquisition, then all file reads are dispatched
+        to a ``ThreadPoolExecutor`` so they run in parallel.  The GIL is
+        released during the underlying ``readinto`` syscall, so threads
+        achieve true I/O parallelism.
+
+        :param keys: Cache keys identifying the KV chunks to load.
+        :returns: A list of ``MemoryObj`` (or ``None`` for missing keys),
+            in the same order as *keys*.
+        """
+        if not keys:
+            return []
+
+        if len(keys) <= 1:
+            return [self.get_blocking(k) for k in keys]
+
+        # --- 1. Batch metadata lookup (single lock acquisition) -----------
+        paths: List[Optional[str]] = []
+        dtypes: List[Optional[torch.dtype]] = []
+        shapes: List[Optional[torch.Size]] = []
+        fmts: List[Optional[MemoryFormat]] = []
+
+        with self.disk_lock:
+            for key in keys:
+                disk_meta = self.dict.get(key)
+                if disk_meta is None:
+                    paths.append(None)
+                    dtypes.append(None)
+                    shapes.append(None)
+                    fmts.append(None)
+                else:
+                    paths.append(disk_meta.path)
+                    dtypes.append(disk_meta.dtype)
+                    shapes.append(disk_meta.shape)
+                    fmts.append(disk_meta.fmt)
+
+        # --- 2. Pre-allocate staging buffers (sequential) -----------------
+        memory_objs: List[Optional[MemoryObj]] = []
+        for dtype, shape, fmt in zip(dtypes, shapes, fmts, strict=True):
+            if dtype is None:
+                memory_objs.append(None)
+                continue
+            assert shape is not None
+            assert fmt is not None
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+            if memory_obj is None:
+                logger.error(
+                    "Memory allocation failed during batched disk load. "
+                    "CPU staging pool may be exhausted."
+                )
+            memory_objs.append(memory_obj)
+
+        # --- 3. Concurrent file reads via thread pool ---------------------
+        results: List[Optional[MemoryObj]] = list(
+            self._read_thread_pool.map(
+                self._load_chunk_into_memory, keys, paths, memory_objs
+            )
+        )
+
+        # --- 4. Update cache policy for successful loads ------------------
+        with self.disk_lock:
+            for key, mem_obj in zip(keys, results, strict=True):
+                if mem_obj is not None and key in self.dict:
+                    self.cache_policy.update_on_hit(key, self.dict)
+
+        return results
+
+    def _load_chunk_into_memory(
+        self,
+        key: CacheEngineKey,
+        path: Optional[str],
+        memory_obj: Optional[MemoryObj],
+    ) -> Optional[MemoryObj]:
+        """Read a single chunk from disk into a pre-allocated ``MemoryObj``.
+
+        Designed to be called from a thread pool -- each invocation is
+        independent and performs a single blocking ``readinto`` syscall.
+
+        :param key: Cache key (used for metadata recovery and error logging).
+        :param path: File path to read from, or ``None`` if the key was not
+            found during the metadata lookup phase.
+        :param memory_obj: Pre-allocated staging buffer, or ``None`` if
+            allocation failed.
+        :returns: The populated ``MemoryObj``, or ``None`` on any failure.
+        """
+        if path is None or memory_obj is None:
+            return None
+
+        try:
+            buffer = memory_obj.byte_array
+            self.read_file(key, buffer, path)
+
+            # Recover metadata (mirrors load_bytes_from_disk).
+            with self.disk_lock:
+                disk_meta = self.dict.get(key)
+                if disk_meta is None:
+                    # Key was evicted between lookup and read, or read_file
+                    # removed it due to FileNotFoundError.
+                    memory_obj.ref_count_down()
+                    return None
+                memory_obj.metadata.cached_positions = disk_meta.cached_positions
+
+            return memory_obj
+        except Exception as e:
+            logger.error("Failed to load chunk from disk for key %s: %s", key, e)
+            memory_obj.ref_count_down()
+            return None
+
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
@@ -674,4 +798,5 @@ class LocalDiskBackend(StorageBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
+        self._read_thread_pool.shutdown(wait=False)
         self.disk_worker.close()
