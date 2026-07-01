@@ -1,0 +1,12 @@
+# LMCache config for the LocalDisk backend e2e test.
+# Used by e2e_lightning_test.sh for comparison against Lightning.
+
+chunk_size: 512
+local_cpu: false
+
+local_disk: "file:///mnt/lmbench/e2e_test_disk"
+max_local_disk_size: 100.0
+
+extra_config:
+  use_odirect: true
+  disk_io_threads: 32

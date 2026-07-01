@@ -1,0 +1,38 @@
+# LMCache configuration for the Lightning PFS storage plugin (POSIX mode)
+# Usage:
+#   LMCACHE_CONFIG_FILE=lmcache_lightning.yaml \
+#     vllm serve meta-llama/Llama-3.1-8B-Instruct \
+#       --gpu-memory-utilization 0.8 \
+#       --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' \
+#       --no-enable-prefix-caching \
+#       --disable-log-requests
+
+# --- Core LMCache settings ---
+chunk_size: 256
+local_cpu: false
+
+# --- Storage plugin ---
+storage_plugins:
+  - lightning
+
+extra_config:
+  # Plugin loading — tells LMCache how to import the backend class.
+  storage_plugin.lightning.module_path: "lmcache.v1.storage_backend.lightning_backend"
+  storage_plugin.lightning.class_name: "LightningPosixBackend"
+
+  # File paths — directory on Lightning PFS for slot data + checkpoint
+  lightning.data_path: "/mnt/nucleus/PFS/gds/lmcache"
+
+  # Slot layout — num_slots=0 means unbounded growth (auto-sized slots,
+  # bounded only by available disk space or max_disk_usage_gb).
+  # Set num_slots to a positive integer to cap the number of slots.
+  lightning.num_slots: 0
+  # lightning.slot_size_mb: 16  # omit to auto-size from KV chunk dimensions
+  # lightning.max_disk_usage_gb: 100  # optional disk budget in GB
+
+  # I/O tuning
+  lightning.io_threads: 32
+  lightning.use_odirect: true
+
+  # Checkpoint — persist index to JSON every second for crash recovery
+  lightning.checkpoint_interval_sec: 1

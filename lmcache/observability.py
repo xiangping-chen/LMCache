@@ -411,6 +411,23 @@ class LMCStatsMonitor:
 
         time_to_retrieve = retrieve_stats.time_to_retrieve()
         retrieve_speed = retrieve_stats.retrieve_speed()
+        logger.info(
+            "Retrieve request %d finished: "
+            "time_to_retrieve=%.5f s, "
+            "num_tokens=%d, local_hit_tokens=%d, "
+            "process_tokens_time=%.5f s, "
+            "broadcast_time=%.5f s, "
+            "to_gpu_time=%.5f s, "
+            "detailed_metrics=%s",
+            retrieve_stats.request_id,
+            time_to_retrieve,
+            retrieve_stats.num_tokens,
+            retrieve_stats.local_hit_tokens,
+            retrieve_stats.process_tokens_time,
+            retrieve_stats.broadcast_time,
+            retrieve_stats.to_gpu_time,
+            retrieve_stats.detailed_metrics,
+        )
         if time_to_retrieve > self.retrieve_time_threshold:
             self.interval_num_slow_retrieval_by_time += 1
         if 0 < retrieve_speed < self.retrieve_token_speed_threshold:

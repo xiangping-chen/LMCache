@@ -266,21 +266,36 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
+        """Transfer KV cache from a CPU memory object into the GPU paged
+        KV cache.
 
-        Note:
-          1. This function expects the 'slot_mapping' is a "full slot mapping"
-             where it's length is the same as the whole token sequence.
-          2. In the case that there is prefix caching, slot_mapping will starts
-             with -1s until the end of the matched prefix. The start and end
-             should NEVER overlap with the prefix caching (which means the
-             underlying CUDA kernel will never see -1 in slot_mapping)
+        When a GPU staging buffer is available (``use_gpu=True``) and the
+        chunk size matches, the transfer is split into two phases for
+        higher throughput:
 
+        1. **Bulk DMA copy** (``Tensor.copy_``): moves the contiguous CPU
+           pinned tensor to a contiguous GPU staging buffer using the
+           ``cudaMemcpyAsync`` DMA engine at near-peak PCIe bandwidth.
+        2. **GPU-internal scatter** (``multi_layer_kv_transfer``): scatters
+           data from the contiguous GPU staging buffer into the paged KV
+           cache entirely within GPU HBM.
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs.
-        :raises AssertionError: If the memory object does not have a tensor.
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        Without the staging buffer the kernel reads from CPU pinned memory
+        via zero-copy mapped access, which is latency-bound and achieves
+        only ~2% of PCIe bandwidth.
+
+        Args:
+            memory_obj: Source memory object whose ``tensor`` holds the KV
+                data on CPU pinned memory.
+            start: Token-level start index within the sequence.
+            end: Token-level end index within the sequence.
+            **kwargs: Must contain ``kvcaches`` (the GPU paged KV cache
+                tensors) and ``slot_mapping`` (token-to-slot mapping).
+                Optionally ``vllm_cached_tokens`` to skip prefix tokens.
+
+        Raises:
+            ValueError: If ``kvcaches`` or ``slot_mapping`` is missing, or
+                if the memory object format is incompatible.
         """
         assert memory_obj.tensor is not None
 
@@ -316,18 +331,38 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
-        lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
-            kv_cache_pointers,
-            slot_mapping[start:end],
-            self.device,
-            self.page_buffer_size,
-            lmc_ops.TransferDirection.H2D,
-            self.engine_kv_format,
-            block_size=self.block_size,
-            head_size=self.head_size,
-            skip_prefix_n_tokens=skip_prefix_n_tokens,
-        )
+        if self.gpu_buffer is not None and end - start == self.gpu_buffer.shape[2]:
+            # Two-phase staged transfer:
+            # Phase 1 — bulk DMA: CPU pinned → GPU staging buffer
+            tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+            tmp_gpu_buffer.copy_(memory_obj.tensor, non_blocking=True)
+            # Phase 2 — GPU scatter: staging buffer → paged KV cache
+            lmc_ops.multi_layer_kv_transfer(
+                tmp_gpu_buffer,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.H2D,
+                self.engine_kv_format,
+                block_size=self.block_size,
+                head_size=self.head_size,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
+            )
+        else:
+            # Fallback: direct zero-copy transfer (slower for CPU sources)
+            lmc_ops.multi_layer_kv_transfer(
+                memory_obj.tensor,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.H2D,
+                self.engine_kv_format,
+                block_size=self.block_size,
+                head_size=self.head_size,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
+            )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -401,8 +436,29 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
-    # TODO(Jiayi): need to optimize to enable real batching
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_to_gpu(
+        self,
+        memory_objs: Union[list[MemoryObj], tuple[MemoryObj, ...]],
+        starts: Union[list[int], tuple[int, ...]],
+        ends: Union[list[int], tuple[int, ...]],
+        **kwargs,
+    ) -> None:
+        """Transfer a batch of CPU memory objects into the GPU paged KV cache.
+
+        Each chunk is transferred via :meth:`to_gpu`, which uses two-phase
+        staged transfer (DMA copy + GPU scatter) when a staging buffer is
+        available, or falls back to direct zero-copy transfer.
+
+        All operations are issued on ``self.load_stream`` and synchronized
+        at the end.
+
+        Args:
+            memory_objs: Source memory objects holding KV data on CPU.
+            starts: Per-chunk token-level start indices.
+            ends: Per-chunk token-level end indices.
+            **kwargs: Forwarded to :meth:`to_gpu` (must include
+                ``kvcaches`` and ``slot_mapping``).
+        """
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
@@ -531,6 +587,37 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        """Transfer KV cache from a CPU memory object into the GPU paged
+        KV cache.
+
+        When a GPU staging buffer is available (``use_gpu=True``) and the
+        chunk size matches, the transfer is split into two phases per
+        layer group for higher throughput:
+
+        1. **Bulk DMA copy** (``Tensor.copy_``): moves the contiguous CPU
+           pinned tensor to a contiguous GPU staging buffer using the
+           ``cudaMemcpyAsync`` DMA engine at near-peak PCIe bandwidth.
+        2. **GPU-internal scatter** (``multi_layer_kv_transfer``): scatters
+           data from the contiguous GPU staging buffer into the paged KV
+           cache entirely within GPU HBM.
+
+        Without the staging buffer the kernel reads from CPU pinned memory
+        via zero-copy mapped access, which is latency-bound and achieves
+        only a fraction of PCIe bandwidth.
+
+        Args:
+            memory_obj: Source memory object whose ``raw_tensor`` holds the
+                KV data on CPU pinned memory.
+            start: Token-level start index within the sequence.
+            end: Token-level end index within the sequence.
+            **kwargs: Must contain ``kvcaches`` (the GPU paged KV cache
+                tensors) and ``slot_mapping`` (token-to-slot mapping).
+                Optionally ``vllm_cached_tokens`` to skip prefix tokens.
+
+        Raises:
+            ValueError: If ``slot_mapping`` is missing or the memory object
+                format is incompatible.
+        """
         assert memory_obj.raw_tensor is not None
         assert "slot_mapping" in kwargs
         if self.use_mla:
@@ -551,21 +638,49 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        use_staging = (
+            self.use_gpu
+            and self.group_tmp_buffer is not None
+            and end - start == self.chunk_size
+        )
+
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
-            lmc_ops.multi_layer_kv_transfer(
-                memory_obj_tensor,
-                kv_cache_pointer,
-                slot_mapping[start:end],
-                self.device,
-                self.page_buffer_size,
-                lmc_ops.TransferDirection.H2D,
-                self.engine_kv_format,
-                block_size=self.block_size,
-                head_size=self.head_size,
-                skip_prefix_n_tokens=skip_prefix_n_tokens,
-            )
+
+            if use_staging:
+                assert self.group_tmp_buffer is not None
+                # Two-phase staged transfer:
+                # Phase 1 — bulk DMA: CPU pinned → GPU staging buffer
+                tmp_gpu_buffer = self.group_tmp_buffer[i][:, :, : end - start, :]
+                tmp_gpu_buffer.copy_(memory_obj_tensor, non_blocking=True)
+                # Phase 2 — GPU scatter: staging buffer → paged KV cache
+                lmc_ops.multi_layer_kv_transfer(
+                    tmp_gpu_buffer,
+                    kv_cache_pointer,
+                    slot_mapping[start:end],
+                    self.device,
+                    self.page_buffer_size,
+                    lmc_ops.TransferDirection.H2D,
+                    self.engine_kv_format,
+                    block_size=self.block_size,
+                    head_size=self.head_size,
+                    skip_prefix_n_tokens=skip_prefix_n_tokens,
+                )
+            else:
+                # Fallback: direct zero-copy transfer
+                lmc_ops.multi_layer_kv_transfer(
+                    memory_obj_tensor,
+                    kv_cache_pointer,
+                    slot_mapping[start:end],
+                    self.device,
+                    self.page_buffer_size,
+                    lmc_ops.TransferDirection.H2D,
+                    self.engine_kv_format,
+                    block_size=self.block_size,
+                    head_size=self.head_size,
+                    skip_prefix_n_tokens=skip_prefix_n_tokens,
+                )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):

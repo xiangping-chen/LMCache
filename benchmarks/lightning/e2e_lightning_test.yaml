@@ -1,0 +1,22 @@
+# LMCache config for the Lightning Posix backend e2e test.
+# Used by e2e_lightning_test.sh.
+
+chunk_size: 512
+local_cpu: false
+
+storage_plugins:
+  - lightning
+
+extra_config:
+  # Plugin loading
+  storage_plugin.lightning.module_path: "lmcache.v1.storage_backend.lightning_backend"
+  storage_plugin.lightning.class_name: "LightningPosixBackend"
+
+  # Storage on NVMe RAID-0
+  lightning.data_path: "/mnt/lmbench/e2e_test"
+
+  # Unbounded growth, auto-sized slots
+  lightning.num_slots: 0
+  lightning.io_threads: 32
+  lightning.use_odirect: true
+  lightning.checkpoint_interval_sec: 1
