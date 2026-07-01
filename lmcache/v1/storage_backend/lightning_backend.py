@@ -1350,7 +1350,12 @@ class LightningPosixBackend(StoragePluginInterface):
         self,
         keys: list[CacheEngineKey],
     ) -> list[MemoryObj | None]:
-        """Batched blocking get with thread pool.
+        """Batched blocking get with concurrent I/O.
+
+        Metadata lookup and memory allocation are performed sequentially
+        under a single lock acquisition, then file reads are dispatched to
+        a ``ThreadPoolExecutor`` so they achieve true I/O parallelism (the
+        GIL is released during the underlying ``preadv`` syscall).
 
         Args:
             keys: List of keys to retrieve.
@@ -1358,20 +1363,53 @@ class LightningPosixBackend(StoragePluginInterface):
         Returns:
             List of MemoryObjs in same order as keys.
         """
+        if not keys:
+            return []
+
+        if len(keys) <= 1:
+            return [self.get_blocking(k) for k in keys]
+
         if instrumentation.is_enabled():
             logger.info("[LIGHTNING_TRACE] batched_get_blocking: %d keys", len(keys))
 
-        # Submit all reads to thread pool
-        futures = [self._executor.submit(self.get_blocking, key) for key in keys]
+        # --- 1. Batch index lookup (single lock acquisition) --------------
+        entries: list[_IndexEntry | None] = []
+        with self.index_lock:
+            for key in keys:
+                entry = self.index.get(key)
+                if entry is not None:
+                    self.lru.touch(key)
+                entries.append(entry)
 
-        # Collect results
-        results = []
-        for future in futures:
-            try:
-                results.append(future.result())
-            except Exception as e:
-                logger.error("Failed to get key: %s", e)
-                results.append(None)
+        # --- 2. Pre-allocate staging buffers (sequential) -----------------
+        memory_objs: list[MemoryObj | None] = []
+        for entry in entries:
+            if entry is None:
+                memory_objs.append(None)
+                continue
+            shape = torch.Size(entry.shape)
+            dtype = torch_dtypes_inverse[entry.dtype]
+            fmt = MemoryFormat(entry.fmt)
+
+            if self.local_cpu_backend is None:
+                logger.error("local_cpu_backend not available for allocation")
+                memory_objs.append(None)
+                continue
+
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt=fmt)
+            if memory_obj is None:
+                logger.error(
+                    "Memory allocation failed during batched read. "
+                    "CPU staging pool may be exhausted."
+                )
+            memory_objs.append(memory_obj)
+
+        # --- 3. Concurrent file reads via thread pool ---------------------
+        results: list[MemoryObj | None] = list(
+            self._executor.map(
+                self._load_chunk_into_memory, entries, memory_objs
+            )
+        )
 
         if instrumentation.is_enabled():
             hits = sum(1 for r in results if r is not None)
@@ -1380,6 +1418,40 @@ class LightningPosixBackend(StoragePluginInterface):
             )
 
         return results
+
+    def _load_chunk_into_memory(
+        self,
+        entry: _IndexEntry | None,
+        memory_obj: MemoryObj | None,
+    ) -> MemoryObj | None:
+        """Read a single chunk from disk into a pre-allocated MemoryObj.
+
+        Designed to be called from a thread pool -- each invocation is
+        independent and performs a single blocking ``preadv`` syscall.
+
+        Args:
+            entry: Index entry with slot location and payload size, or None
+                if the key was not found.
+            memory_obj: Pre-allocated staging buffer, or None if allocation
+                failed.
+
+        Returns:
+            The populated MemoryObj, or None on any failure.
+        """
+        if entry is None or memory_obj is None:
+            return None
+
+        try:
+            memory_obj.ref_count_up()
+            offset = self._get_file_offset(entry.slot_id)
+            self._read_obj(offset, memory_obj, entry.payload_len)
+        except Exception as e:
+            logger.error("Failed to read chunk from slot %d: %s", entry.slot_id, e)
+            memory_obj.ref_count_down()
+            return None
+
+        memory_obj.ref_count_down()
+        return memory_obj
 
     def touch_cache(self) -> None:
         """Update cache policy with keys accessed during a request.
